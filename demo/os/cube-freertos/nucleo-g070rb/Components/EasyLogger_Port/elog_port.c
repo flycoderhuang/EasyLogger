@@ -22,21 +22,18 @@
  * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  *
- * Function: Portable interface for linux.
+ * Function: Portable interface for each platform.
  * Created on: 2015-04-28
  */
 
 #include <elog.h>
 #include <stdio.h>
-#include <pthread.h>
-#include <unistd.h>
-#include <time.h>
-#include <sys/syscall.h>
+#include "cmsis_os2.h"
+#include "usart.h"
 
-#ifdef ELOG_FILE_ENABLE
-#include <elog_file.h>
-#endif
-static pthread_mutex_t output_lock;
+extern osSemaphoreId_t elog_lockHandle;
+extern osSemaphoreId_t elog_asyncHandle;
+extern osSemaphoreId_t elog_dma_lockHandle;
 
 /**
  * EasyLogger port initialize
@@ -46,11 +43,9 @@ static pthread_mutex_t output_lock;
 ElogErrCode elog_port_init(void) {
     ElogErrCode result = ELOG_NO_ERR;
 
-    pthread_mutex_init(&output_lock, NULL);
-
-#ifdef ELOG_FILE_ENABLE
-    elog_file_init();
-#endif
+    osSemaphoreRelease(elog_dma_lockHandle);
+    osSemaphoreRelease(elog_lockHandle);
+    /* add your code here */
 
     return result;
 }
@@ -60,13 +55,7 @@ ElogErrCode elog_port_init(void) {
  *
  */
 void elog_port_deinit(void) {
-#ifdef ELOG_FILE_ENABLE
-    elog_file_deinit();
-#endif
-
-    pthread_mutex_destroy(&output_lock);
 }
-
 
 /**
  * output log port interface
@@ -75,31 +64,22 @@ void elog_port_deinit(void) {
  * @param size log size
  */
 void elog_port_output(const char *log, size_t size) {
-    /* output to terminal */
-#ifdef ELOG_TERMINAL_ENABLE
-    printf("%.*s", (int)size, log);
-#endif
-
-#ifdef ELOG_FILE_ENABLE
-    /* write the file */
-    elog_file_write(log, size);
-#endif 
+    HAL_UART_Transmit_DMA(&huart2, (uint8_t *) log, size);
 }
 
 /**
  * output lock
  */
 void elog_port_output_lock(void) {
-    pthread_mutex_lock(&output_lock);
+    osSemaphoreAcquire(elog_lockHandle, osWaitForever);
 }
 
 /**
  * output unlock
  */
 void elog_port_output_unlock(void) {
-    pthread_mutex_unlock(&output_lock);
+    osSemaphoreRelease(elog_lockHandle);
 }
-
 
 /**
  * get current time interface
@@ -107,16 +87,8 @@ void elog_port_output_unlock(void) {
  * @return current time
  */
 const char *elog_port_get_time(void) {
-    static char cur_system_time[24] = { 0 };
-
-    time_t cur_t;
-    struct tm cur_tm;
-
-    time(&cur_t);
-    localtime_r(&cur_t, &cur_tm);
-
-    strftime(cur_system_time, sizeof(cur_system_time), "%Y-%m-%d %T", &cur_tm);
-
+    static char cur_system_time[16] = "";
+    snprintf(cur_system_time, 16, "%lu", osKernelGetTickCount());
     return cur_system_time;
 }
 
@@ -126,11 +98,7 @@ const char *elog_port_get_time(void) {
  * @return current process name
  */
 const char *elog_port_get_p_info(void) {
-    static char cur_process_info[10] = { 0 };
-
-    snprintf(cur_process_info, 10, "pid:%04d", getpid());
-
-    return cur_process_info;
+    return "";
 }
 
 /**
@@ -139,9 +107,39 @@ const char *elog_port_get_p_info(void) {
  * @return current thread name
  */
 const char *elog_port_get_t_info(void) {
-    static char cur_thread_info[10] = { 0 };
+    return "";
+}
 
-    snprintf(cur_thread_info, 10, "tid:%04d", syscall(SYS_gettid));
+void elog_async_output_notice(void) {
+    osSemaphoreRelease(elog_asyncHandle);
+}
 
-    return cur_thread_info;
+void elog_entry(void *para) {
+    size_t get_log_size = 0;
+    static char poll_get_buf[ELOG_LINE_BUF_SIZE - 4];
+
+    if (elog_port_init() != ELOG_NO_ERR) {
+        goto fail;
+    }
+
+    while (1) {
+        if (osOK ==
+            osSemaphoreAcquire(elog_asyncHandle, osWaitForever)) {
+            while (1) {
+                if (osOK ==
+                    osSemaphoreAcquire(elog_dma_lockHandle, osWaitForever)) {
+                    get_log_size = elog_async_get_line_log(poll_get_buf, sizeof(poll_get_buf));
+                    if (get_log_size) {
+                        elog_port_output(poll_get_buf, get_log_size);
+                    } else {
+                        osSemaphoreRelease(elog_dma_lockHandle);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    fail:
+    osThreadExit();
 }
